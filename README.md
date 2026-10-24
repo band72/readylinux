@@ -60,7 +60,7 @@ Snap and Flatpak files are linked into `~/Documents/AppFiles`, and that folder i
 
 ## 5. Find my file
 
-Show Apps gets Find my file, with its own folder-and-magnifier icon. It is a window with a name box and checkboxes for where to look:
+Show Apps gets Find my file, with its own icon: a document and a magnifier on a blue tile. It is a window with a name box and checkboxes for where to look:
 
 - Documents and Downloads, checked by default.
 - Home folder, everything under your home except hidden folders.

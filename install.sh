@@ -900,31 +900,30 @@ put_file "$HOME/.local/bin/where-is-my-file-gui" <<'EOF'
 exec "$HOME/.local/bin/where-is-my-file" --gui
 EOF
 chmod +x "$HOME/.local/bin/where-is-my-file-gui"
-# Folder with a magnifier. hicolor is the fallback theme on every desktop.
+# A document and a magnifier on a blue tile. hicolor is the fallback theme on every desktop.
 icons="$HOME/.local/share/icons/hicolor"
 put_file "$icons/scalable/apps/readylinux-find-my-file.svg" <<'SVG'
 <svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
   <defs>
-    <linearGradient id="back" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0" stop-color="#e5a50a"/>
-      <stop offset="1" stop-color="#c88800"/>
+    <linearGradient id="tile" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#3584e4"/>
+      <stop offset="1" stop-color="#1a5fb4"/>
     </linearGradient>
-    <linearGradient id="front" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0" stop-color="#f8e45c"/>
-      <stop offset="1" stop-color="#f6c342"/>
+    <linearGradient id="ring" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#ffa348"/>
+      <stop offset="1" stop-color="#e66100"/>
     </linearGradient>
-    <radialGradient id="glass" cx="0.4" cy="0.35" r="0.7">
-      <stop offset="0" stop-color="#ffffff" stop-opacity="0.95"/>
-      <stop offset="1" stop-color="#99c1f1" stop-opacity="0.85"/>
-    </radialGradient>
   </defs>
-  <path d="M10 26a8 8 0 0 1 8-8h28l10 10h54a8 8 0 0 1 8 8v66a8 8 0 0 1-8 8H18a8 8 0 0 1-8-8z" fill="url(#back)"/>
-  <rect x="10" y="38" width="108" height="72" rx="8" fill="url(#front)"/>
-  <rect x="10" y="38" width="108" height="3" fill="#ffffff" opacity="0.5"/>
-  <path d="M84 84l26 26" stroke="#3d3846" stroke-width="13" stroke-linecap="round"/>
-  <path d="M84 84l26 26" stroke="#5e5c64" stroke-width="7" stroke-linecap="round"/>
-  <circle cx="66" cy="66" r="25" fill="url(#glass)" stroke="#1c71d8" stroke-width="7"/>
-  <path d="M53 58a15 15 0 0 1 12-9" fill="none" stroke="#ffffff" stroke-width="4" stroke-linecap="round" opacity="0.9"/>
+  <rect x="8" y="8" width="112" height="112" rx="26" fill="url(#tile)"/>
+  <rect x="8" y="8" width="112" height="56" rx="26" fill="#ffffff" opacity="0.08"/>
+  <path d="M30 22h38l18 18v62a6 6 0 0 1-6 6H30a6 6 0 0 1-6-6V28a6 6 0 0 1 6-6z" fill="#ffffff"/>
+  <path d="M68 22v12a6 6 0 0 0 6 6h12z" fill="#c0bfbc"/>
+  <rect x="34" y="50" width="34" height="5" rx="2.5" fill="#99c1f1"/>
+  <rect x="34" y="62" width="26" height="5" rx="2.5" fill="#99c1f1"/>
+  <rect x="34" y="74" width="20" height="5" rx="2.5" fill="#99c1f1"/>
+  <path d="M90 90l16 16" stroke="#241f31" stroke-width="12" stroke-linecap="round"/>
+  <circle cx="78" cy="78" r="19" fill="#ffffff" fill-opacity="0.85" stroke="url(#ring)" stroke-width="8"/>
+  <path d="M69 72a11 11 0 0 1 8-6" fill="none" stroke="#ffffff" stroke-width="3.5" stroke-linecap="round"/>
 </svg>
 SVG
 if [[ "$KIT_CHANGED" == "1" ]]; then
