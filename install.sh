@@ -268,14 +268,14 @@ EOF
       fi
     fi
     pkgs+=(google-chrome-stable brave-browser)
-    have=()
+    pkg_have=()
     for p in "${pkgs[@]}"; do
-      if rpm -q "$p" >/dev/null 2>&1; then have+=("$p"); else PKG_MISSING+=("$p"); fi
+      if rpm -q "$p" >/dev/null 2>&1; then pkg_have+=("$p"); else PKG_MISSING+=("$p"); fi
     done
-    if ((${#have[@]})); then
+    if ((${#pkg_have[@]})); then
       while read -r p; do
         [[ -n "$p" ]] && PKG_OUTDATED+=("$p")
-      done < <(sudo dnf -q list --upgrades "${have[@]}" 2>/dev/null \
+      done < <(sudo dnf -q list --upgrades "${pkg_have[@]}" 2>/dev/null \
                  | awk '$1 ~ /\./ { sub(/\.[^.]+$/, "", $1); print $1 }' | sort -u)
     fi
     pkg_report "${pkgs[@]}"
@@ -1516,7 +1516,10 @@ PY
              thunderbird.desktop org.keepassxc.KeePassXC.desktop \
              libreoffice-writer.desktop xed.desktop org.gnome.TextEditor.desktop kolourpaint.desktop org.kde.kolourpaint.desktop \
              thunar.desktop org.gnome.Calculator.desktop xfce4-terminal.desktop)
-      editor="$(ls /usr/share/applications | grep -iE '^(xed|org.gnome.TextEditor|mousepad)' | head -n1 || true)"
+      editor=""
+      for e in /usr/share/applications/{xed,org.gnome.TextEditor,mousepad}*.desktop; do
+        if [[ -f "$e" ]]; then editor="$(basename "$e")"; break; fi
+      done
       [[ -n "$editor" ]] && names+=("$editor")
       args=(-c xfce4-panel -p /plugins/plugin-1/favorites -n)
       for n in "${names[@]}"; do

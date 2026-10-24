@@ -2,6 +2,8 @@
 # Tests for install.sh helpers. Runs in a throwaway HOME, needs no sudo.
 #   bash tests/test_install.sh
 set -uo pipefail
+# Variables below are read inside check's eval strings.
+# shellcheck disable=SC2034
 repo="$(cd "$(dirname "$0")/.." && pwd)"
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
