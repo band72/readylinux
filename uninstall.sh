@@ -47,6 +47,8 @@ rm -f "$HOME/.config/systemd/user/human-linux-usb-watch.service" \
       "$HOME/.local/share/applications/where-is-my-file.desktop" \
       "$HOME/.local/share/applications/brax-me.desktop" \
       "$HOME/.local/share/icons/brax-me.png" \
+      "$HOME/.local/share/icons/hicolor/scalable/apps/readylinux-find-my-file.svg" \
+      "$HOME/.local/share/human-linux/version" \
       "$HOME/.local/share/backgrounds/human-linux-wallpaper.jpg"
 # Undo AppImage integration. Remove the launcher and put the file back in Downloads.
 shopt -s nullglob

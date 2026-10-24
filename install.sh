@@ -47,9 +47,16 @@ if [ -z "${BASH_VERSION:-}" ]; then
   exec bash "$0" "$@"
 fi
 # Double-click in Files does nothing useful. Use install.desktop, or run in a terminal.
+KIT_VERSION="2026.10.24"
+KIT_STAMP="$HOME/.local/share/human-linux/version"
 if [[ ! -t 1 ]]; then
+  if [[ -f "$KIT_STAMP" ]]; then
+    intro="ReadyLinux $(head -n1 "$KIT_STAMP") is already installed. This is $KIT_VERSION.\n\nIt checks each app and kit file, installs what is missing, and updates what is out of date. Nothing up to date is touched."
+  else
+    intro="This installs KeePassXC, KolourPaint, Chrome, VLC, Thunderbird, GDebi, Disks, and Flatpak.\n\nIt also sets folders, the dock, the lid rule, and Find my file."
+  fi
   zenity --question --width=420 --title="ReadyLinux" \
-    --text="This installs KeePassXC, KolourPaint, Chrome, VLC, Thunderbird, GDebi, Disks, and Flatpak.\n\nIt also sets folders, the dock, the lid rule, and Find my file.\n\nA terminal will open so you can enter your password. Continue?" \
+    --text="$intro\n\nA terminal will open so you can enter your password. Continue?" \
     || exit 0
   term="$(command -v gnome-terminal || command -v x-terminal-emulator || true)"
   [[ -n "$term" ]] || { zenity --error --text="No terminal found."; exit 1; }
@@ -71,6 +78,49 @@ if [[ "$(id -u)" -eq 0 ]]; then
   exit 1
 fi
 
+# A rerun checks what is there. Kit files are compared before writing, and
+# each one is reported as new, updated, or up to date in the summary.
+if [[ -f "$KIT_STAMP" ]]; then
+  KIT_PREV="$(head -n1 "$KIT_STAMP")"
+  log "ReadyLinux $KIT_PREV found. Checking for missing or outdated items ($KIT_VERSION)."
+else
+  KIT_PREV=""
+  log "ReadyLinux $KIT_VERSION, first run"
+fi
+KIT_NEW=()
+KIT_UPDATED=()
+KIT_SAME=0
+# put_file DEST [sudo] < content
+# Writes DEST only when the content differs. KIT_CHANGED is 1 if it did.
+KIT_CHANGED=0
+put_file() {
+  local dest="$1" as="${2:-}" tmp
+  tmp="$(mktemp)"
+  cat > "$tmp"
+  KIT_CHANGED=0
+  if [[ -f "$dest" ]] && cmp -s "$tmp" "$dest"; then
+    rm -f "$tmp"
+    KIT_SAME=$((KIT_SAME + 1))
+    return 0
+  fi
+  KIT_CHANGED=1
+  if [[ -f "$dest" ]]; then
+    KIT_UPDATED+=("$dest")
+    printf '    updated   %s\n' "$dest"
+  else
+    KIT_NEW+=("$dest")
+    printf '    installed %s\n' "$dest"
+  fi
+  if [[ "$as" == "sudo" ]]; then
+    sudo mkdir -p "$(dirname "$dest")"
+    sudo tee "$dest" < "$tmp" >/dev/null
+  else
+    mkdir -p "$(dirname "$dest")"
+    cat "$tmp" > "$dest"
+  fi
+  rm -f "$tmp"
+}
+
 desktop_session() {
   printf '%s\n' "${XDG_CURRENT_DESKTOP:-${DESKTOP_SESSION:-unknown}}"
 }
@@ -81,63 +131,115 @@ desktop_session() {
 # Chrome and Brave are added from their own repos. Fedora 41+ needs the
 # dnf5 repo command. Cinnamon also gets Xed. Fedora gets Dash to Dock.
 # ---------------------------------------------------------------------------
-log "Installing packages"
+log "Checking packages"
 . /etc/os-release
+# Each package is reported as ok, update, or missing. Only missing ones are
+# installed and only outdated ones are upgraded, so a rerun is quick.
+PKG_MISSING=()
+PKG_OUTDATED=()
+pkg_report() {
+  local p state
+  for p in "$@"; do
+    state="ok"
+    if [[ " ${PKG_MISSING[*]} " == *" $p "* ]]; then state="missing"
+    elif [[ " ${PKG_OUTDATED[*]} " == *" $p "* ]]; then state="update"
+    fi
+    printf '    %-8s %s\n' "$state" "$p"
+  done
+}
 case "${ID:-}" in
   fedora)
-    sudo dnf install -y \
-      curl ca-certificates wget gnupg2 \
-      zenity flatpak \
-      keepassxc kolourpaint thunderbird firefox vlc gnome-text-editor gnome-disk-utility \
-      gnome-shell-extension-dash-to-dock
+    pkgs=(curl ca-certificates wget gnupg2 zenity flatpak python3-gobject gtk3
+          keepassxc kolourpaint thunderbird firefox vlc gnome-text-editor gnome-disk-utility
+          gnome-shell-extension-dash-to-dock)
     if ! rpm -q google-chrome-stable >/dev/null 2>&1; then
       log "Adding Google Chrome"
       sudo dnf install -y https://dl.google.com/linux/direct/google-chrome-stable_current_x86_64.rpm
     fi
-    if ! rpm -q brave-browser >/dev/null 2>&1; then
-      log "Adding Brave"
+    if ! rpm -q brave-browser >/dev/null 2>&1 && [[ ! -f /etc/yum.repos.d/brave-browser.repo ]]; then
+      log "Adding the Brave repo"
       sudo dnf install -y dnf-plugins-core
       if dnf config-manager --help 2>&1 | grep -q addrepo; then
         sudo dnf config-manager addrepo --from-repofile=https://brave-browser-rpm-release.s3.brave.com/brave-browser.repo
       else
         sudo dnf config-manager --add-repo https://brave-browser-rpm-release.s3.brave.com/brave-browser.repo
       fi
-      sudo dnf install -y brave-browser
+    fi
+    pkgs+=(google-chrome-stable brave-browser)
+    have=()
+    for p in "${pkgs[@]}"; do
+      if rpm -q "$p" >/dev/null 2>&1; then have+=("$p"); else PKG_MISSING+=("$p"); fi
+    done
+    if ((${#have[@]})); then
+      while read -r p; do
+        [[ -n "$p" ]] && PKG_OUTDATED+=("$p")
+      done < <(sudo dnf -q list --upgrades "${have[@]}" 2>/dev/null \
+                 | awk '$1 ~ /\./ { sub(/\.[^.]+$/, "", $1); print $1 }' | sort -u)
+    fi
+    pkg_report "${pkgs[@]}"
+    if ((${#PKG_MISSING[@]})); then
+      log "Installing ${#PKG_MISSING[@]} missing package(s)"
+      sudo dnf install -y "${PKG_MISSING[@]}"
+    fi
+    if ((${#PKG_OUTDATED[@]})); then
+      log "Updating ${#PKG_OUTDATED[@]} package(s)"
+      sudo dnf upgrade -y "${PKG_OUTDATED[@]}"
     fi
     ;;
   *)
-    sudo apt-get update
-    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
-      curl ca-certificates wget gnupg \
-      zenity flatpak gdebi gnome-disk-utility \
-      keepassxc kolourpaint thunderbird firefox vlc
-    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y gnome-text-editor 2>/dev/null \
-      || sudo DEBIAN_FRONTEND=noninteractive apt-get install -y gedit 2>/dev/null \
-      || true
-    if [[ "${XDG_CURRENT_DESKTOP:-}${DESKTOP_SESSION:-}" == *[Cc]innamon* ]]; then
-      sudo DEBIAN_FRONTEND=noninteractive apt-get install -y xed || true
+    pkg_installed() { dpkg-query -W -f='${Status}' "$1" 2>/dev/null | grep -q 'install ok installed'; }
+    pkgs=(curl ca-certificates wget gnupg zenity flatpak gdebi gnome-disk-utility
+          python3-gi gir1.2-gtk-3.0
+          keepassxc kolourpaint thunderbird firefox vlc)
+    if pkg_installed gnome-text-editor; then pkgs+=(gnome-text-editor)
+    elif pkg_installed gedit; then pkgs+=(gedit)
+    elif apt-cache show gnome-text-editor >/dev/null 2>&1; then pkgs+=(gnome-text-editor)
+    else pkgs+=(gedit)
     fi
-    if ! dpkg -s google-chrome-stable >/dev/null 2>&1; then
-      log "Adding Google Chrome"
+    if [[ "${XDG_CURRENT_DESKTOP:-}${DESKTOP_SESSION:-}" == *[Cc]innamon* ]]; then
+      pkgs+=(xed)
+    fi
+    if [[ ! -f /etc/apt/sources.list.d/google-chrome.list ]] && ! pkg_installed google-chrome-stable; then
+      log "Adding the Google Chrome repo"
       sudo mkdir -p /usr/share/keyrings /tmp
       curl -fsSL -o /tmp/google-chrome.pub https://dl.google.com/linux/linux_signing_key.pub
       sudo rm -f /usr/share/keyrings/google-chrome.gpg
       sudo gpg --batch --yes --dearmor -o /usr/share/keyrings/google-chrome.gpg /tmp/google-chrome.pub
       echo "deb [arch=amd64 signed-by=/usr/share/keyrings/google-chrome.gpg] https://dl.google.com/linux/chrome/deb/ stable main" \
         | sudo tee /etc/apt/sources.list.d/google-chrome.list >/dev/null
-      sudo apt-get update
-      sudo DEBIAN_FRONTEND=noninteractive apt-get install -y google-chrome-stable
     fi
-    if ! dpkg -s brave-browser >/dev/null 2>&1; then
-      log "Adding Brave"
+    if [[ ! -f /etc/apt/sources.list.d/brave-browser-release.list ]] && ! pkg_installed brave-browser; then
+      log "Adding the Brave repo"
       sudo mkdir -p /usr/share/keyrings
       curl -fsSL -o /tmp/brave-browser-archive-keyring.gpg \
         https://brave-browser-apt-release.s3.brave.com/brave-browser-archive-keyring.gpg
       sudo cp /tmp/brave-browser-archive-keyring.gpg /usr/share/keyrings/brave-browser-archive-keyring.gpg
       echo "deb [signed-by=/usr/share/keyrings/brave-browser-archive-keyring.gpg] https://brave-browser-apt-release.s3.brave.com/ stable main" \
         | sudo tee /etc/apt/sources.list.d/brave-browser-release.list >/dev/null
-      sudo apt-get update
-      sudo DEBIAN_FRONTEND=noninteractive apt-get install -y brave-browser
+    fi
+    pkgs+=(google-chrome-stable brave-browser)
+    sudo apt-get update
+    upgradable=" $(apt list --upgradable 2>/dev/null | awk -F/ 'NR>1 {printf "%s ", $1}')"
+    for p in "${pkgs[@]}"; do
+      if ! pkg_installed "$p"; then PKG_MISSING+=("$p")
+      elif [[ "$upgradable" == *" $p "* ]]; then PKG_OUTDATED+=("$p")
+      fi
+    done
+    pkg_report "${pkgs[@]}"
+    if ((${#PKG_MISSING[@]})); then
+      log "Installing ${#PKG_MISSING[@]} missing package(s)"
+      sudo DEBIAN_FRONTEND=noninteractive apt-get install -y "${PKG_MISSING[@]}" || {
+        # One bad name (an editor or xed not in this release) should not stop the rest.
+        warn "Batch install failed. Trying one at a time."
+        for p in "${PKG_MISSING[@]}"; do
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y "$p" || warn "Could not install $p"
+        done
+      }
+    fi
+    if ((${#PKG_OUTDATED[@]})); then
+      log "Updating ${#PKG_OUTDATED[@]} package(s)"
+      sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --only-upgrade "${PKG_OUTDATED[@]}" \
+        || warn "Some updates failed. Run Software Updater."
     fi
     ;;
 esac
@@ -173,7 +275,7 @@ fi
 # Lid: suspend on battery, awake on AC and dock. Do not restart logind.
 log "Lid close rule (applies on next reboot)"
 sudo mkdir -p /etc/systemd/logind.conf.d
-sudo tee /etc/systemd/logind.conf.d/human-linux-lid.conf >/dev/null <<'EOF'
+put_file /etc/systemd/logind.conf.d/human-linux-lid.conf sudo <<'EOF'
 [Login]
 HandleLidSwitch=suspend
 HandleLidSwitchExternalPower=ignore
@@ -285,7 +387,7 @@ bookmark "file:///" "File System"
 # ---------------------------------------------------------------------------
 log "USB watcher"
 mkdir -p "$HOME/.local/bin" "$HOME/.config/systemd/user"
-cat > "$HOME/.local/bin/human-linux-usb-watch" <<'EOF'
+put_file "$HOME/.local/bin/human-linux-usb-watch" <<'EOF'
 #!/usr/bin/env bash
 refresh() {
   local user src d gvfs mtp dev mp fstype
@@ -336,8 +438,9 @@ udisksctl monitor | while read -r line; do
   esac
 done
 EOF
+watch_changed=$KIT_CHANGED
 chmod +x "$HOME/.local/bin/human-linux-usb-watch"
-cat > "$HOME/.config/systemd/user/human-linux-usb-watch.service" <<EOF
+put_file "$HOME/.config/systemd/user/human-linux-usb-watch.service" <<EOF
 [Unit]
 Description=Refresh ReadyLinux Media links
 After=graphical-session.target
@@ -348,51 +451,437 @@ RestartSec=3
 [Install]
 WantedBy=default.target
 EOF
+watch_changed=$((watch_changed | KIT_CHANGED))
 systemctl --user disable --now usb-watch.service 2>/dev/null || true
 rm -f "$HOME/.config/systemd/user/usb-watch.service" "$HOME/.local/bin/usb-watch"
 systemctl --user daemon-reload || true
 systemctl --user enable human-linux-usb-watch.service || true
-systemctl --user restart human-linux-usb-watch.service || warn "Disk watcher not started. Log in on the desktop and rerun."
+if [[ "$watch_changed" == "1" ]] || ! systemctl --user is-active --quiet human-linux-usb-watch.service; then
+  systemctl --user restart human-linux-usb-watch.service || warn "Disk watcher not started. Log in on the desktop and rerun."
+else
+  echo "    disk watcher running and up to date"
+fi
 
 # ---------------------------------------------------------------------------
 # Find my file
 # A small search GUI in Show Apps. Same on every distro.
 # ---------------------------------------------------------------------------
 log "Find my file"
-cat > "$HOME/.local/bin/where-is-my-file" <<'EOF'
-#!/usr/bin/env bash
-q="${1:-}"
-[[ -n "$q" ]] || { echo "usage: where-is-my-file <name>"; exit 1; }
-roots=(
-  "$HOME/Documents" "$HOME/Downloads" "$HOME/Videos" "$HOME/Pictures"
-  "$HOME/Desktop" "$HOME/Media" "$HOME/Documents/AppFiles"
-  "$HOME/snap" "$HOME/.var/app"
-)
-find "${roots[@]}" -iname "*${q}*" 2>/dev/null | head -n 50
-EOF
+# One Python program. With a name it prints matches in a terminal.
+# With no name it opens a GTK form: Documents, Downloads, Home folder, All.
+# It falls back to zenity dialogs if the GTK bindings are missing.
+put_file "$HOME/.local/bin/where-is-my-file" <<'PYAPP'
+#!/usr/bin/env python3
+# Find my file. A search form for the user's own folders.
+#   where-is-my-file                     open the window
+#   where-is-my-file [--documents] [--downloads] [--home] [--all] NAME
+#                                        print matches in a terminal
+# Documents and Downloads are the default. Home is everything under ~.
+# All adds the disks and phone under ~/Media, and Snap and Flatpak app files.
+import os
+import re
+import subprocess
+import sys
+import threading
+import time
+
+HOME = os.path.expanduser("~")
+LIMIT = 1000
+
+
+def user_dir(key, fallback):
+    # Localized names come from xdg-user-dirs, e.g. ~/Documentos.
+    try:
+        with open(os.path.join(HOME, ".config/user-dirs.dirs")) as f:
+            for line in f:
+                m = re.match(r'\s*XDG_%s_DIR="(.*)"' % key, line)
+                if m:
+                    return m.group(1).replace("$HOME", HOME)
+    except OSError:
+        pass
+    return os.path.join(HOME, fallback)
+
+
+DOCUMENTS = user_dir("DOCUMENTS", "Documents")
+DOWNLOADS = user_dir("DOWNLOAD", "Downloads")
+
+
+def roots_for(scopes):
+    if "all" in scopes or "home" in scopes:
+        roots = [HOME]
+    else:
+        roots = []
+        if "documents" in scopes:
+            roots.append(DOCUMENTS)
+        if "downloads" in scopes:
+            roots.append(DOWNLOADS)
+    return [r for r in roots if os.path.isdir(r)]
+
+
+def search(query, scopes, stop=None):
+    """Yield matching paths. Case-insensitive, plain text, no wildcards.
+    Hidden folders are skipped. Links are followed, each folder is visited
+    once, and outside ~ only when All is checked (USB disks, phone)."""
+    needle = query.lower()
+    outside_ok = "all" in scopes
+    seen = set()
+    for root in roots_for(scopes):
+        for top, dirs, files in os.walk(root, followlinks=True, onerror=None):
+            if stop is not None and stop.is_set():
+                return
+            try:
+                st = os.stat(top)
+            except OSError:
+                dirs[:] = []
+                continue
+            if (st.st_dev, st.st_ino) in seen:
+                dirs[:] = []
+                continue
+            seen.add((st.st_dev, st.st_ino))
+            real = os.path.realpath(top)
+            if not outside_ok and real != HOME and not real.startswith(HOME + os.sep):
+                dirs[:] = []
+                continue
+            dirs[:] = sorted(d for d in dirs if not d.startswith("."))
+            for name in dirs + sorted(f for f in files if not f.startswith(".")):
+                if needle in name.lower():
+                    yield os.path.join(top, name)
+
+
+def human_size(n):
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
+
+
+def cli(argv):
+    scopes = {a[2:] for a in argv if a.startswith("--")}
+    words = [a for a in argv if not a.startswith("--")]
+    bad = scopes - {"documents", "downloads", "home", "all"}
+    if not words or bad:
+        print("usage: where-is-my-file [--documents] [--downloads] [--home] [--all] <name>")
+        return 1
+    scopes = scopes or {"documents", "downloads"}
+    found = 0
+    for path in search(" ".join(words), scopes):
+        print(path)
+        found += 1
+        if found >= LIMIT:
+            print(f"... stopped at {LIMIT} matches", file=sys.stderr)
+            break
+    return 0 if found else 1
+
+
+def zenity_gui():
+    # No GTK bindings. Same form, built from zenity dialogs.
+    def z(*args):
+        r = subprocess.run(["zenity", *args], capture_output=True, text=True)
+        return r.returncode, r.stdout.strip()
+    rc, query = z("--entry", "--title=Find my file", "--text=Name or part of a name",
+                  "--ok-label=Next", "--cancel-label=Cancel")
+    if rc != 0 or not query:
+        return 0
+    rc, picked = z("--list", "--checklist", "--title=Find my file", "--text=Search in",
+                   "--column=", "--column=Where", "--column=key", "--hide-column=3",
+                   "--print-column=3", "--separator= ", "--height=300", "--ok-label=Search",
+                   "TRUE", "Documents", "documents", "TRUE", "Downloads", "downloads",
+                   "FALSE", "Home folder (everything in it)", "home",
+                   "FALSE", "All (home, USB disks, phone, app files)", "all")
+    if rc != 0:
+        return 0
+    scopes = set(picked.split()) or {"documents", "downloads"}
+    hits = []
+    for p in search(query, scopes):
+        hits.append(p)
+        if len(hits) >= LIMIT:
+            break
+    if not hits:
+        z("--info", "--title=Find my file", "--text=No matches for: " + query.replace("&", "&amp;").replace("<", "&lt;"))
+        return 0
+    args = ["--list", f"--title=Find my file: {len(hits)} found", "--text=Pick a file and press Open",
+            "--column=Name", "--column=Folder", "--column=path", "--hide-column=3",
+            "--print-column=3", "--width=800", "--height=500", "--ok-label=Open", "--cancel-label=Close"]
+    for p in hits:
+        args += [os.path.basename(p), os.path.dirname(p), p]
+    rc, path = z(*args)
+    if rc == 0 and path:
+        subprocess.Popen(["xdg-open", path.split("|")[0]])
+    return 0
+
+
+def gtk_gui():
+    import gi
+    gi.require_version("Gtk", "3.0")
+    from gi.repository import Gdk, Gio, GLib, Gtk
+
+    class Finder(Gtk.Window):
+        def __init__(self):
+            super().__init__(title="Find my file")
+            self.set_default_size(900, 600)
+            self.set_icon_name("readylinux-find-my-file")
+            self.stop = threading.Event()
+            self.job = 0
+
+            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10, margin=14)
+            self.add(box)
+
+            row = Gtk.Box(spacing=8)
+            row.pack_start(Gtk.Label(label="Name or part of a name:"), False, False, 0)
+            self.entry = Gtk.SearchEntry()
+            self.entry.connect("activate", self.on_search)
+            row.pack_start(self.entry, True, True, 0)
+            self.search_btn = Gtk.Button(label="Search")
+            self.search_btn.get_style_context().add_class("suggested-action")
+            self.search_btn.connect("clicked", self.on_search)
+            row.pack_start(self.search_btn, False, False, 0)
+            self.stop_btn = Gtk.Button(label="Stop", sensitive=False)
+            self.stop_btn.connect("clicked", lambda *_: self.stop.set())
+            row.pack_start(self.stop_btn, False, False, 0)
+            box.pack_start(row, False, False, 0)
+
+            frame = Gtk.Frame(label="Search in")
+            checks = Gtk.Box(spacing=18, margin=8)
+            frame.add(checks)
+            self.checks = {}
+            for key, label, tip, on in (
+                ("documents", "Documents", DOCUMENTS, True),
+                ("downloads", "Downloads", DOWNLOADS, True),
+                ("home", "Home folder", "Everything in " + HOME + ", except hidden folders", False),
+                ("all", "All", "Home, plus USB disks and phone under ~/Media, and Snap and Flatpak app files", False),
+            ):
+                cb = Gtk.CheckButton(label=label, active=on, tooltip_text=tip)
+                cb.connect("toggled", self.on_scope)
+                checks.pack_start(cb, False, False, 0)
+                self.checks[key] = cb
+            box.pack_start(frame, False, False, 0)
+
+            # name, folder, modified, size, path, mtime, bytes
+            self.store = Gtk.ListStore(str, str, str, str, str, float, GLib.TYPE_INT64)
+            self.view = Gtk.TreeView(model=self.store)
+            for i, (title, sort_col, expand) in enumerate((
+                ("Name", 0, True), ("Folder", 1, True), ("Modified", 5, False), ("Size", 6, False),
+            )):
+                cell = Gtk.CellRendererText(ellipsize=3 if i < 2 else 0)
+                col = Gtk.TreeViewColumn(title, cell, text=i)
+                col.set_sort_column_id(sort_col)
+                col.set_resizable(True)
+                col.set_expand(expand)
+                self.view.append_column(col)
+            self.view.connect("row-activated", lambda *_: self.open_selected())
+            self.view.get_selection().connect("changed", self.on_select)
+            scroll = Gtk.ScrolledWindow(hexpand=True, vexpand=True)
+            scroll.add(self.view)
+            box.pack_start(scroll, True, True, 0)
+
+            bottom = Gtk.Box(spacing=8)
+            self.status = Gtk.Label(label="Type a name, pick where to look, press Search.", xalign=0)
+            bottom.pack_start(self.status, True, True, 0)
+            self.open_btn = Gtk.Button(label="Open", sensitive=False)
+            self.open_btn.connect("clicked", lambda *_: self.open_selected())
+            self.folder_btn = Gtk.Button(label="Show in folder", sensitive=False)
+            self.folder_btn.connect("clicked", lambda *_: self.show_in_folder())
+            self.copy_btn = Gtk.Button(label="Copy path", sensitive=False)
+            self.copy_btn.connect("clicked", lambda *_: self.copy_path())
+            for b in (self.copy_btn, self.folder_btn, self.open_btn):
+                bottom.pack_end(b, False, False, 0)
+            box.pack_start(bottom, False, False, 0)
+
+            self.connect("destroy", self.on_quit)
+            self.on_scope()
+
+        # "All" covers Home, and Home covers Documents and Downloads.
+        def on_scope(self, *_):
+            c = self.checks
+            c["home"].set_sensitive(not c["all"].get_active())
+            wide = c["all"].get_active() or c["home"].get_active()
+            c["documents"].set_sensitive(not wide)
+            c["downloads"].set_sensitive(not wide)
+
+        def scopes(self):
+            c = self.checks
+            if c["all"].get_active():
+                return {"all"}
+            if c["home"].get_active():
+                return {"home"}
+            return {k for k in ("documents", "downloads") if c[k].get_active()}
+
+        def on_search(self, *_):
+            query = self.entry.get_text().strip()
+            if not query:
+                self.status.set_text("Type a name first.")
+                return
+            scopes = self.scopes()
+            if not scopes:
+                self.status.set_text("Check at least one place to search.")
+                return
+            self.stop.set()
+            self.stop = threading.Event()
+            self.job += 1
+            self.store.clear()
+            self.found = 0
+            self.search_btn.set_sensitive(False)
+            self.stop_btn.set_sensitive(True)
+            self.status.set_text("Searching…")
+            threading.Thread(target=self.worker, args=(self.job, query, scopes, self.stop), daemon=True).start()
+
+        def worker(self, job, query, scopes, stop):
+            batch, last = [], time.monotonic()
+            count = 0
+            for path in search(query, scopes, stop):
+                try:
+                    st = os.stat(path)
+                    mtime, size = st.st_mtime, st.st_size
+                    is_dir = os.path.isdir(path)
+                except OSError:
+                    mtime, size, is_dir = 0.0, 0, False
+                batch.append((path, mtime, size, is_dir))
+                count += 1
+                if count >= LIMIT:
+                    break
+                if time.monotonic() - last > 0.2:
+                    GLib.idle_add(self.add_rows, job, batch)
+                    batch, last = [], time.monotonic()
+            GLib.idle_add(self.add_rows, job, batch)
+            GLib.idle_add(self.done, job, query, count >= LIMIT, stop.is_set())
+
+        def add_rows(self, job, batch):
+            if job != self.job:
+                return False
+            for path, mtime, size, is_dir in batch:
+                when = time.strftime("%Y-%m-%d %H:%M", time.localtime(mtime)) if mtime else ""
+                shown = "folder" if is_dir else human_size(size)
+                self.store.append([os.path.basename(path), os.path.dirname(path), when, shown,
+                                   path, mtime, -1 if is_dir else size])
+            self.found += len(batch)
+            self.status.set_text(f"Searching… {self.found} found")
+            return False
+
+        def done(self, job, query, capped, stopped):
+            if job != self.job:
+                return False
+            self.search_btn.set_sensitive(True)
+            self.stop_btn.set_sensitive(False)
+            if self.found == 0:
+                msg = f"No matches for “{query}”."
+                if not stopped and not self.checks["all"].get_active():
+                    msg += " Try a wider place, like Home folder or All."
+            else:
+                msg = f"{self.found} found. Double-click to open."
+                if capped:
+                    msg = f"First {LIMIT} shown. Type more of the name to narrow it."
+            if stopped:
+                msg = "Stopped. " + msg
+            self.status.set_text(msg)
+            return False
+
+        def selected_path(self):
+            model, it = self.view.get_selection().get_selected()
+            return model[it][4] if it else None
+
+        def on_select(self, *_):
+            on = self.selected_path() is not None
+            for b in (self.open_btn, self.folder_btn, self.copy_btn):
+                b.set_sensitive(on)
+
+        def open_selected(self):
+            path = self.selected_path()
+            if path:
+                try:
+                    Gio.AppInfo.launch_default_for_uri(Gio.File.new_for_path(path).get_uri(), None)
+                except GLib.Error:
+                    subprocess.Popen(["xdg-open", path])
+
+        def show_in_folder(self):
+            path = self.selected_path()
+            if not path:
+                return
+            # FileManager1 opens the folder with the file selected. Not every file manager has it.
+            try:
+                bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+                bus.call_sync("org.freedesktop.FileManager1", "/org/freedesktop/FileManager1",
+                              "org.freedesktop.FileManager1", "ShowItems",
+                              GLib.Variant("(ass)", ([Gio.File.new_for_path(path).get_uri()], "")),
+                              None, Gio.DBusCallFlags.NONE, 3000, None)
+            except GLib.Error:
+                subprocess.Popen(["xdg-open", os.path.dirname(path)])
+
+        def copy_path(self):
+            path = self.selected_path()
+            if path:
+                Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD).set_text(path, -1)
+                self.status.set_text("Path copied.")
+
+        def on_quit(self, *_):
+            self.stop.set()
+            Gtk.main_quit()
+
+    win = Finder()
+    win.show_all()
+    Gtk.main()
+    return 0
+
+
+if __name__ == "__main__":
+    args = sys.argv[1:]
+    if args and args != ["--gui"]:
+        sys.exit(cli(args))
+    try:
+        sys.exit(gtk_gui())
+    except (ImportError, ValueError):
+        sys.exit(zenity_gui())
+PYAPP
 chmod +x "$HOME/.local/bin/where-is-my-file"
-cat > "$HOME/.local/bin/where-is-my-file-gui" <<'EOF'
+# Kept so old menu entries and keyboard shortcuts still work.
+put_file "$HOME/.local/bin/where-is-my-file-gui" <<'EOF'
 #!/usr/bin/env bash
-q="$(zenity --entry --title="Find my file" --text="Name or part of a name" --ok-label="Search" --cancel-label="Cancel")" || exit 0
-[[ -z "$q" ]] && exit 0
-hits="$("$HOME/.local/bin/where-is-my-file" "$q")"
-if [[ -z "$hits" ]]; then
-  zenity --info --title="Find my file" --text="No matches for: $q" --ok-label="OK"
-  exit 0
-fi
-zenity --info --title="Find my file: $q" --ok-label="OK" --width=700 --text="$hits"
+exec "$HOME/.local/bin/where-is-my-file" --gui
 EOF
 chmod +x "$HOME/.local/bin/where-is-my-file-gui"
+# Folder with a magnifier. hicolor is the fallback theme on every desktop.
+icons="$HOME/.local/share/icons/hicolor"
+put_file "$icons/scalable/apps/readylinux-find-my-file.svg" <<'SVG'
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <defs>
+    <linearGradient id="back" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#e5a50a"/>
+      <stop offset="1" stop-color="#c88800"/>
+    </linearGradient>
+    <linearGradient id="front" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#f8e45c"/>
+      <stop offset="1" stop-color="#f6c342"/>
+    </linearGradient>
+    <radialGradient id="glass" cx="0.4" cy="0.35" r="0.7">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.95"/>
+      <stop offset="1" stop-color="#99c1f1" stop-opacity="0.85"/>
+    </radialGradient>
+  </defs>
+  <path d="M10 26a8 8 0 0 1 8-8h28l10 10h54a8 8 0 0 1 8 8v66a8 8 0 0 1-8 8H18a8 8 0 0 1-8-8z" fill="url(#back)"/>
+  <rect x="10" y="38" width="108" height="72" rx="8" fill="url(#front)"/>
+  <rect x="10" y="38" width="108" height="3" fill="#ffffff" opacity="0.5"/>
+  <path d="M84 84l26 26" stroke="#3d3846" stroke-width="13" stroke-linecap="round"/>
+  <path d="M84 84l26 26" stroke="#5e5c64" stroke-width="7" stroke-linecap="round"/>
+  <circle cx="66" cy="66" r="25" fill="url(#glass)" stroke="#1c71d8" stroke-width="7"/>
+  <path d="M53 58a15 15 0 0 1 12-9" fill="none" stroke="#ffffff" stroke-width="4" stroke-linecap="round" opacity="0.9"/>
+</svg>
+SVG
+if [[ "$KIT_CHANGED" == "1" ]]; then
+  [[ -f "$icons/index.theme" ]] || cp -f /usr/share/icons/hicolor/index.theme "$icons/" 2>/dev/null || true
+  gtk-update-icon-cache -f -t "$icons" >/dev/null 2>&1 || true
+fi
 mkdir -p "$HOME/.local/share/applications"
-cat > "$HOME/.local/share/applications/where-is-my-file.desktop" <<EOF
+put_file "$HOME/.local/share/applications/where-is-my-file.desktop" <<EOF
 [Desktop Entry]
 Name=Find my file
-Comment=Search Documents, Media, Snap and Flatpak folders
-Exec=$HOME/.local/bin/where-is-my-file-gui
+GenericName=File search
+Comment=Search Documents, Downloads, your Home folder, or everything including USB disks
+Keywords=find;search;file;locate;where;
+Exec=$HOME/.local/bin/where-is-my-file --gui
 Terminal=false
 Type=Application
-Icon=system-search
+Icon=readylinux-find-my-file
 Categories=Utility;
+StartupNotify=true
 X-ReadyLinux=true
 EOF
 
@@ -404,18 +893,19 @@ EOF
 log "AppImage launchers"
 mkdir -p "$HOME/Applications" "$HOME/.local/share/icons" "$HOME/Documents/AppFiles/appimages"
 integrate_appimage() {
-  local src="$1" base name dest icon
+  local src="$1" base name dest icon desk
   [[ -f "$src" && ! -L "$src" ]] || return 0
   base="$(basename "$src")"
   name="${base%.[Aa]pp[Ii]mage}"
   dest="$HOME/Applications/$base"
+  icon="$HOME/.local/share/icons/${name}.png"
   if [[ "$src" != "$dest" ]]; then
     mv "$src" "$dest"
   fi
   chmod +x "$dest" || true
   ln -sfn "$dest" "$HOME/Documents/AppFiles/appimages/$base" || true
   desk="$HOME/.local/share/applications/human-linux-appimage-${name}.desktop"
-  cat > "$desk" <<EOF
+  put_file "$desk" <<EOF
 [Desktop Entry]
 Name=$name
 Exec=$dest
@@ -462,7 +952,7 @@ browser="$(command -v brave-browser || command -v google-chrome-stable || comman
 if [[ -n "$browser" ]]; then
   mkdir -p "$HOME/.local/share/icons"
   curl -fsSL -o "$HOME/.local/share/icons/brax-me.png" "$BRAX_ICON_URL" || warn "Brax icon download failed"
-  cat > "$HOME/.local/share/applications/brax-me.desktop" <<EOF
+  put_file "$HOME/.local/share/applications/brax-me.desktop" <<EOF
 [Desktop Entry]
 Name=Brax.me
 Comment=brax.me
@@ -555,7 +1045,7 @@ if id="$(first_existing_desktop org.gnome.Software.desktop gnome-software.deskto
   done
 fi
 mkdir -p "$HOME/.local/bin" "$HOME/.local/share/applications"
-cat > "$HOME/.local/bin/open-appimage" <<'EOF'
+put_file "$HOME/.local/bin/open-appimage" <<'EOF'
 #!/usr/bin/env bash
 f="${1:-}"
 [[ -n "$f" && -f "$f" ]] || exit 1
@@ -597,7 +1087,7 @@ update-desktop-database "$HOME/.local/share/applications" 2>/dev/null || true
 exec "$dest"
 EOF
 chmod +x "$HOME/.local/bin/open-appimage"
-cat > "$HOME/.local/share/applications/open-appimage.desktop" <<EOF
+put_file "$HOME/.local/share/applications/open-appimage.desktop" <<EOF
 [Desktop Entry]
 Name=Install AppImage
 Exec=$HOME/.local/bin/open-appimage %f
@@ -608,7 +1098,7 @@ NoDisplay=true
 X-ReadyLinux=true
 EOF
 mkdir -p "$HOME/.local/share/mime/packages"
-cat > "$HOME/.local/share/mime/packages/appimage.xml" <<'EOF'
+put_file "$HOME/.local/share/mime/packages/appimage.xml" <<'EOF'
 <?xml version="1.0" encoding="UTF-8"?>
 <mime-info xmlns="http://www.freedesktop.org/standards/shared-mime-info">
   <mime-type type="application/vnd.appimage">
@@ -630,7 +1120,7 @@ done
 shopt -u nullglob
 if id="$(first_existing_desktop gnome-disk-image-writer.desktop org.gnome.DiskUtility.desktop)"; then
   mkdir -p "$HOME/.local/bin" "$HOME/.local/share/applications"
-  cat > "$HOME/.local/bin/open-iso" <<'EOF'
+  put_file "$HOME/.local/bin/open-iso" <<'EOF'
 #!/usr/bin/env bash
 iso="${1:-}"
 [[ -n "$iso" && -f "$iso" ]] || exit 1
@@ -655,7 +1145,7 @@ fi
 exec gnome-disks
 EOF
   chmod +x "$HOME/.local/bin/open-iso"
-  cat > "$HOME/.local/share/applications/open-iso.desktop" <<EOF
+  put_file "$HOME/.local/share/applications/open-iso.desktop" <<EOF
 [Desktop Entry]
 Name=Write ISO to USB
 Exec=$HOME/.local/bin/open-iso %f
@@ -812,7 +1302,7 @@ PY
     files_fav="$HOME/.config/cosmic/com.system76.CosmicFiles/v1/favorites"
     mkdir -p "$(dirname "$files_fav")"
     if [[ ! -f "$files_fav" ]]; then
-      cat > "$files_fav" <<EOF
+      put_file "$files_fav" <<EOF
 [
     Home,
     Documents,
@@ -1076,7 +1566,7 @@ PY
     # Thunar does not remember position. The menu launcher moves it after open.
     if command -v wmctrl >/dev/null && command -v xdotool >/dev/null; then
       mkdir -p "$HOME/.local/bin" "$HOME/.local/share/applications"
-      cat > "$HOME/.local/bin/thunar-place" <<'EOF'
+      put_file "$HOME/.local/bin/thunar-place" <<'EOF'
 #!/usr/bin/env bash
 /usr/bin/thunar "$@" &
 sleep 0.6
@@ -1088,7 +1578,7 @@ xdotool windowmove "$dec" 40 40
 xdotool windowsize "$dec" 1100 700
 EOF
       chmod +x "$HOME/.local/bin/thunar-place"
-      cat > "$HOME/.local/share/applications/thunar.desktop" <<EOF
+      put_file "$HOME/.local/share/applications/thunar.desktop" <<EOF
 [Desktop Entry]
 Name=Thunar
 Exec=$HOME/.local/bin/thunar-place %F
@@ -1213,7 +1703,7 @@ for uid in uids:
     print("gnome-terminal next window 110x34", uid)
 PY
   mkdir -p "$HOME/.local/share/applications"
-  cat > "$HOME/.local/share/applications/org.gnome.Terminal.desktop" <<EOF
+  put_file "$HOME/.local/share/applications/org.gnome.Terminal.desktop" <<EOF
 [Desktop Entry]
 Name=Terminal
 Exec=gnome-terminal --geometry=110x34
@@ -1323,7 +1813,7 @@ update-desktop-database "$HOME/.local/share/applications" 2>/dev/null || true
 
 # Click a .sh in Files: Run or Edit, instead of opening the text editor.
 log "Script launcher"
-cat > "$HOME/.local/bin/sh-launcher" <<'EOF'
+put_file "$HOME/.local/bin/sh-launcher" <<'EOF'
 #!/usr/bin/env bash
 f="${1:-}"
 [[ -n "$f" && -f "$f" ]] || { zenity --error --text="No script given."; exit 1; }
@@ -1354,7 +1844,7 @@ else
 fi
 EOF
 chmod +x "$HOME/.local/bin/sh-launcher"
-cat > "$HOME/.local/share/applications/sh-launcher.desktop" <<EOF
+put_file "$HOME/.local/share/applications/sh-launcher.desktop" <<EOF
 [Desktop Entry]
 Name=Script launcher
 Exec=$HOME/.local/bin/sh-launcher %f
@@ -1381,7 +1871,7 @@ if [[ -f "$0" ]]; then
     cp -f "$(dirname "$0")/uninstall.sh" "$kit/uninstall.sh"
     chmod +x "$kit/uninstall.sh"
   fi
-  cat > "$HOME/.local/share/applications/human-linux-install.desktop" <<EOF
+  put_file "$HOME/.local/share/applications/human-linux-install.desktop" <<EOF
 [Desktop Entry]
 Name=ReadyLinux install
 Comment=Preview, confirm, then run the install
@@ -1391,7 +1881,7 @@ Type=Application
 Icon=system-software-install
 Categories=Utility;
 EOF
-  cat > "$HOME/.local/share/applications/human-linux-uninstall.desktop" <<EOF
+  put_file "$HOME/.local/share/applications/human-linux-uninstall.desktop" <<EOF
 [Desktop Entry]
 Name=ReadyLinux uninstall
 Comment=Preview, confirm, then remove kit files
@@ -1407,7 +1897,17 @@ EOF
   gio set "$HOME/.local/share/applications/human-linux-uninstall.desktop" metadata::trusted true 2>/dev/null || true
 fi
 
+mkdir -p "$(dirname "$KIT_STAMP")"
+printf '%s\n%s\n' "$KIT_VERSION" "$(date -Iseconds)" > "$KIT_STAMP"
+
 log "Done."
+if [[ -n "$KIT_PREV" && "$KIT_PREV" != "$KIT_VERSION" ]]; then
+  echo "Updated ReadyLinux $KIT_PREV to $KIT_VERSION."
+elif [[ -n "$KIT_PREV" ]]; then
+  echo "ReadyLinux $KIT_VERSION was already installed. Rechecked."
+fi
+echo "Packages: ${#PKG_MISSING[@]} installed, ${#PKG_OUTDATED[@]} updated."
+echo "Kit files: ${#KIT_NEW[@]} new, ${#KIT_UPDATED[@]} updated, $KIT_SAME already up to date."
 echo "Plug a USB stick in. It should appear under ~/Media/Disks after Ubuntu mounts it."
 echo "Show Apps: ReadyLinux install, and ReadyLinux uninstall."
 echo "Log out and back in if Show Apps or the dock did not update."

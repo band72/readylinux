@@ -24,6 +24,8 @@ wget -qO- https://raw.githubusercontent.com/robbraxman/readylinux/main/install.s
 
 You are asked for your password once. The rest is automatic. The script does not restart logind.
 
+Run it again any time. A rerun checks each app and reports it as ok, update, or missing, then installs only what is missing and updates only what is out of date. Kit files such as Find my file are compared before they are written, and the summary says how many were new, updated, or already up to date. The installed version is kept in `~/.local/share/human-linux/version`.
+
 Undo the script changes:
 
 ```bash
@@ -58,7 +60,15 @@ Snap and Flatpak files are linked into `~/Documents/AppFiles`, and that folder i
 
 ## 5. Find my file
 
-Show Apps gets Find my file. It searches your user folders, including Documents, Media, and AppFiles. It does not search system folders. This is a GUI Search tool.
+Show Apps gets Find my file, with its own folder-and-magnifier icon. It is a window with a name box and checkboxes for where to look:
+
+- Documents and Downloads, checked by default.
+- Home folder, everything under your home except hidden folders.
+- All, your home plus USB disks and a phone under `~/Media`, and Snap and Flatpak app files.
+
+Results show the name, folder, date, and size. Double-click opens the file. Show in folder opens Files with it selected. Copy path copies it. Names are matched as plain text, so brackets and stars in a file name are fine. It never searches system folders.
+
+In a terminal: `where-is-my-file --home report` prints the matches. The flags are `--documents`, `--downloads`, `--home`, and `--all`.
 
 ## 6. Browser isolation
 
