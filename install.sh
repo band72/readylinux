@@ -494,7 +494,7 @@ refresh
 ( while true; do sleep 60; refresh; done ) &
 udisksctl monitor | while read -r line; do
   case "$line" in
-    *Added*|*Removed*|*mounted*|*unmounted*|*Properties\ Changed*) refresh ;;
+    *Added*|*Removed*|*mounted*|*Properties\ Changed*) refresh ;;
   esac
 done
 EOF
