@@ -96,3 +96,16 @@ Ubuntu's dock starts on the left. On Ubuntu, Zorin, and Fedora Workstation the s
 Lid close. Settings has no useful control. On AC power the lid does not suspend. On battery it does. The system part applies on the next reboot.
 
 IPv4. On a dual-stack network the machine prefers IPv4, so IPv6 is not the path used for tracking or a VPN leak. This is the normal home default, including Starlink CGNAT. An IPv6-only network, such as some hotel or airport Wi-Fi, can be exempted per connection in Network Manager. It is not a permanent block.
+
+## Development
+
+The whole install runs inside one `main` function that is called on the last line, so a download cut off part way does nothing. Settings such as scale, fonts, terminal size, and the dock are set once. If you change one yourself, a rerun keeps your value.
+
+Tests need no sudo and run in a throwaway home folder:
+
+```bash
+python3 -m unittest discover -s tests -v
+bash tests/test_install.sh
+```
+
+GitHub Actions runs these, plus ShellCheck on the scripts and on each helper that `install.sh` writes. `python3 tests/embedded.py --list` shows those helpers.

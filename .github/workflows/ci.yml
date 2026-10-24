@@ -1,0 +1,38 @@
+name: CI
+on:
+  push:
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Bash syntax
+        run: |
+          bash -n install.sh
+          bash -n uninstall.sh
+
+      - name: ShellCheck
+        run: shellcheck -S warning install.sh uninstall.sh tests/test_install.sh
+
+      # install.sh writes these helpers with heredocs, so ShellCheck does not
+      # see them above. Pull each one out and check it on its own.
+      - name: ShellCheck embedded helpers
+        run: |
+          mkdir -p "$RUNNER_TEMP/helpers"
+          for name in human-linux-usb-watch where-is-my-file-gui open-appimage open-iso thunar-place sh-launcher; do
+            python3 tests/embedded.py "$name" > "$RUNNER_TEMP/helpers/$name"
+          done
+          shellcheck -S warning -s bash "$RUNNER_TEMP"/helpers/*
+
+      - name: Find my file compiles
+        run: |
+          python3 tests/embedded.py where-is-my-file > "$RUNNER_TEMP/where_is_my_file.py"
+          python3 -m py_compile "$RUNNER_TEMP/where_is_my_file.py"
+
+      - name: Tests
+        run: |
+          python3 -m unittest discover -s tests -v
+          bash tests/test_install.sh

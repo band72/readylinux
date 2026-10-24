@@ -42,51 +42,30 @@
 #   GNOME: dock clicks can freeze until a logout after pins are written.
 #   Colors are not forced on any terminal. The user keeps their palette.
 #
-# Mint's file manager may run this with sh. That fails on lines 9, 17, and 23.
+# Mint's file manager may run this with sh. sh would fail on the bash syntax below.
 if [ -z "${BASH_VERSION:-}" ]; then
   exec bash "$0" "$@"
 fi
-# Double-click in Files does nothing useful. Use install.desktop, or run in a terminal.
-KIT_VERSION="2026.10.24"
-KIT_STAMP="$HOME/.local/share/human-linux/version"
-if [[ ! -t 1 ]]; then
-  if [[ -f "$KIT_STAMP" ]]; then
-    intro="ReadyLinux $(head -n1 "$KIT_STAMP") is already installed. This is $KIT_VERSION.\n\nIt checks each app and kit file, installs what is missing, and updates what is out of date. Nothing up to date is touched."
-  else
-    intro="This installs KeePassXC, KolourPaint, Chrome, VLC, Thunderbird, GDebi, Disks, and Flatpak.\n\nIt also sets folders, the dock, the lid rule, and Find my file."
-  fi
-  zenity --question --width=420 --title="ReadyLinux" \
-    --text="$intro\n\nA terminal will open so you can enter your password. Continue?" \
-    || exit 0
-  term="$(command -v gnome-terminal || command -v x-terminal-emulator || true)"
-  [[ -n "$term" ]] || { zenity --error --text="No terminal found."; exit 1; }
-  exec "$term" -- bash -c "\"$0\"; echo; read -r -p 'Press Enter to close.'"
-fi
-set -euo pipefail
 
-SCALE="1.25"
-WALLPAPER_URL="https://brax.me/readylinux/wallpaper.jpg"
-BRAX_ICON_URL="https://brax.me/img/logo-b1a.png"
-BRAX_URL="https://brax.me"
+# ---------------------------------------------------------------------------
+# Helpers
+# Defined at the top level so the tests can load them with READYLINUX_TEST=1.
+# ---------------------------------------------------------------------------
+KIT_VERSION="2026.10.24"
+KIT_DIR="$HOME/.local/share/human-linux"
+KIT_STAMP="$KIT_DIR/version"
+KIT_SETTINGS="$KIT_DIR/settings.json"
 
 log()  { printf '\n==> %s\n' "$*"; }
 warn() { printf '!!  %s\n' "$*" >&2; }
 need_cmd() { command -v "$1" >/dev/null 2>&1; }
 
-if [[ "$(id -u)" -eq 0 ]]; then
-  warn "Run as your user, not root. The script will ask for sudo."
-  exit 1
-fi
+desktop_session() {
+  printf '%s\n' "${XDG_CURRENT_DESKTOP:-${DESKTOP_SESSION:-unknown}}"
+}
 
 # A rerun checks what is there. Kit files are compared before writing, and
 # each one is reported as new, updated, or up to date in the summary.
-if [[ -f "$KIT_STAMP" ]]; then
-  KIT_PREV="$(head -n1 "$KIT_STAMP")"
-  log "ReadyLinux $KIT_PREV found. Checking for missing or outdated items ($KIT_VERSION)."
-else
-  KIT_PREV=""
-  log "ReadyLinux $KIT_VERSION, first run"
-fi
 KIT_NEW=()
 KIT_UPDATED=()
 KIT_SAME=0
@@ -121,9 +100,122 @@ put_file() {
   rm -f "$tmp"
 }
 
-desktop_session() {
-  printf '%s\n' "${XDG_CURRENT_DESKTOP:-${DESKTOP_SESSION:-unknown}}"
+# gset_once SCHEMA[:PATH] KEY VALUE [SCHEMA KEY VALUE ...]
+# Sets a GSettings key only if the user has never changed it, or if it still
+# holds the value the kit set last time. A value the user picked is kept.
+# What the kit set is remembered in ~/.local/share/human-linux/settings.json.
+gset_once() {
+  need_cmd python3 || return 0
+  python3 - "$KIT_SETTINGS" "$@" <<'PY' || true
+import json, sys
+from pathlib import Path
+try:
+    import gi
+    from gi.repository import Gio, GLib
+except Exception:
+    raise SystemExit(0)
+state = Path(sys.argv[1])
+args = sys.argv[2:]
+try:
+    seen = json.loads(state.read_text())
+except Exception:
+    seen = {}
+source = Gio.SettingsSchemaSource.get_default()
+for i in range(0, len(args) - 2, 3):
+    spec, key, text = args[i:i + 3]
+    schema_id, _, path = spec.partition(":")
+    schema = source.lookup(schema_id, True) if source else None
+    if schema is None or not schema.has_key(key):
+        continue
+    settings = Gio.Settings.new_full(schema, None, path or None)
+    if not settings.is_writable(key):
+        continue
+    try:
+        want = GLib.Variant.parse(schema.get_key(key).get_value_type(), text, None, None)
+    except GLib.Error as e:
+        print(f"    bad value for {schema_id} {key}: {text} ({e.message})")
+        continue
+    tag = f"{spec} {key}"
+    user = settings.get_user_value(key)
+    if user is not None and user.equal(want):
+        seen[tag] = want.print_(False)
+        continue
+    if user is not None and user.print_(False) != seen.get(tag):
+        print(f"    kept      {schema_id} {key} = {user.print_(False)} (your setting)")
+        continue
+    settings.set_value(key, want)
+    seen[tag] = want.print_(False)
+    print(f"    set       {schema_id} {key} = {want.print_(False)}")
+Gio.Settings.sync()
+state.parent.mkdir(parents=True, exist_ok=True)
+state.write_text(json.dumps(seen, indent=1, sort_keys=True) + "\n")
+PY
 }
+
+# fetch_image URL DEST
+# Downloads to a temp file and keeps it only if it is a JPEG or PNG under 20 MB.
+# An error page, a redirect to HTML, or a truncated file is thrown away.
+fetch_image() {
+  local url="$1" dest="$2" tmp magic
+  tmp="$(mktemp)"
+  if curl -fsSL --max-filesize 20000000 -o "$tmp" "$url"; then
+    magic="$(head -c 4 "$tmp" | od -An -tx1 | tr -d ' \n')"
+    case "$magic" in
+      ffd8ff*|89504e47)
+        mkdir -p "$(dirname "$dest")"
+        install -m 644 "$tmp" "$dest"
+        rm -f "$tmp"
+        return 0
+        ;;
+    esac
+    warn "$url is not a JPEG or PNG. Skipped."
+  fi
+  rm -f "$tmp"
+  return 1
+}
+
+# ---------------------------------------------------------------------------
+# The whole install is one function, called on the last line. When the script
+# is piped into bash, a download cut off part way defines nothing and runs
+# nothing, and no command can read the rest of the script from stdin.
+# ---------------------------------------------------------------------------
+main() {
+# Double-click in Files does nothing useful. Use install.desktop, or run in a terminal.
+if [[ ! -t 1 ]]; then
+  if [[ -f "$KIT_STAMP" ]]; then
+    intro="ReadyLinux $(head -n1 "$KIT_STAMP") is already installed. This is $KIT_VERSION.\n\nIt checks each app and kit file, installs what is missing, and updates what is out of date. Nothing up to date is touched."
+  else
+    intro="This installs KeePassXC, KolourPaint, Chrome, VLC, Thunderbird, GDebi, Disks, and Flatpak.\n\nIt also sets folders, the dock, the lid rule, and Find my file."
+  fi
+  zenity --question --width=420 --title="ReadyLinux" \
+    --text="$intro\n\nA terminal will open so you can enter your password. Continue?" \
+    || exit 0
+  term="$(command -v gnome-terminal || command -v x-terminal-emulator || true)"
+  [[ -n "$term" ]] || { zenity --error --text="No terminal found."; exit 1; }
+  exec "$term" -- bash -c "\"$0\"; echo; read -r -p 'Press Enter to close.'"
+fi
+set -euo pipefail
+
+SCALE="1.25"
+WALLPAPER_URL="https://brax.me/readylinux/wallpaper.jpg"
+BRAX_ICON_URL="https://brax.me/img/logo-b1a.png"
+BRAX_URL="https://brax.me"
+
+if [[ "$(id -u)" -eq 0 ]]; then
+  warn "Run as your user, not root. The script will ask for sudo."
+  exit 1
+fi
+
+if [[ -f "$KIT_STAMP" ]]; then
+  KIT_PREV="$(head -n1 "$KIT_STAMP")"
+  log "ReadyLinux $KIT_PREV found. Checking for missing or outdated items ($KIT_VERSION)."
+else
+  KIT_PREV=""
+  log "ReadyLinux $KIT_VERSION, first run"
+fi
+# Private scratch space. Fixed names in /tmp can be pre-created by another user.
+KIT_TMP="$(mktemp -d)"
+trap 'rm -rf "$KIT_TMP"' EXIT
 
 # ---------------------------------------------------------------------------
 # System packages
@@ -152,9 +244,19 @@ case "${ID:-}" in
     pkgs=(curl ca-certificates wget gnupg2 zenity flatpak python3-gobject gtk3
           keepassxc kolourpaint thunderbird firefox vlc gnome-text-editor gnome-disk-utility
           gnome-shell-extension-dash-to-dock)
+    # Chrome comes from Google's repo with gpgcheck on, not a bare .rpm URL.
+    # dnf does not check signatures on a package given by URL.
     if ! rpm -q google-chrome-stable >/dev/null 2>&1; then
-      log "Adding Google Chrome"
-      sudo dnf install -y https://dl.google.com/linux/direct/google-chrome-stable_current_x86_64.rpm
+      log "Adding the Google Chrome repo"
+      sudo rpm --import https://dl.google.com/linux/linux_signing_key.pub
+      put_file /etc/yum.repos.d/google-chrome.repo sudo <<'EOF'
+[google-chrome]
+name=google-chrome
+baseurl=https://dl.google.com/linux/chrome/rpm/stable/x86_64
+enabled=1
+gpgcheck=1
+gpgkey=https://dl.google.com/linux/linux_signing_key.pub
+EOF
     fi
     if ! rpm -q brave-browser >/dev/null 2>&1 && [[ ! -f /etc/yum.repos.d/brave-browser.repo ]]; then
       log "Adding the Brave repo"
@@ -201,19 +303,19 @@ case "${ID:-}" in
     fi
     if [[ ! -f /etc/apt/sources.list.d/google-chrome.list ]] && ! pkg_installed google-chrome-stable; then
       log "Adding the Google Chrome repo"
-      sudo mkdir -p /usr/share/keyrings /tmp
-      curl -fsSL -o /tmp/google-chrome.pub https://dl.google.com/linux/linux_signing_key.pub
+      sudo mkdir -p /usr/share/keyrings
+      curl -fsSL -o "$KIT_TMP/google-chrome.pub" https://dl.google.com/linux/linux_signing_key.pub
       sudo rm -f /usr/share/keyrings/google-chrome.gpg
-      sudo gpg --batch --yes --dearmor -o /usr/share/keyrings/google-chrome.gpg /tmp/google-chrome.pub
+      sudo gpg --batch --yes --dearmor -o /usr/share/keyrings/google-chrome.gpg "$KIT_TMP/google-chrome.pub"
       echo "deb [arch=amd64 signed-by=/usr/share/keyrings/google-chrome.gpg] https://dl.google.com/linux/chrome/deb/ stable main" \
         | sudo tee /etc/apt/sources.list.d/google-chrome.list >/dev/null
     fi
     if [[ ! -f /etc/apt/sources.list.d/brave-browser-release.list ]] && ! pkg_installed brave-browser; then
       log "Adding the Brave repo"
       sudo mkdir -p /usr/share/keyrings
-      curl -fsSL -o /tmp/brave-browser-archive-keyring.gpg \
+      curl -fsSL -o "$KIT_TMP/brave-browser-archive-keyring.gpg" \
         https://brave-browser-apt-release.s3.brave.com/brave-browser-archive-keyring.gpg
-      sudo cp /tmp/brave-browser-archive-keyring.gpg /usr/share/keyrings/brave-browser-archive-keyring.gpg
+      sudo install -m 644 "$KIT_TMP/brave-browser-archive-keyring.gpg" /usr/share/keyrings/brave-browser-archive-keyring.gpg
       echo "deb [signed-by=/usr/share/keyrings/brave-browser-archive-keyring.gpg] https://brave-browser-apt-release.s3.brave.com/ stable main" \
         | sudo tee /etc/apt/sources.list.d/brave-browser-release.list >/dev/null
     fi
@@ -289,48 +391,6 @@ EOF
 # Bookmarks are GTK, so Nautilus, Nemo, Caja, and Thunar all see them.
 # KDE places are written later, in the desktop branch.
 # ---------------------------------------------------------------------------
-refresh_media_links() {
-  local user src d gvfs mtp line dev mp fstype
-  user="$(id -un)"
-  mkdir -p "$HOME/Media/Disks"
-  # Mount extra data partitions (NVMe, internal). Skip system, swap, and optical.
-  if command -v lsblk >/dev/null && command -v udisksctl >/dev/null; then
-    while read -r dev fstype label mp; do
-      [[ -n "$dev" && -n "$fstype" ]] || continue
-      [[ "$fstype" == "swap" || "$fstype" == "iso9660" ]] && continue
-      case "$mp" in
-        /|/boot|/boot/efi|/home) continue ;;
-      esac
-      [[ -n "$mp" ]] && continue
-      case "${label,,}" in
-        boot|efi|esp|system|recovery|winre|winre_drv|"microsoft reserved"|reserved) continue ;;
-      esac
-      udisksctl mount -b "$dev" >/dev/null 2>&1 || true
-    done < <(lsblk -pnr -o PATH,FSTYPE,LABEL,MOUNTPOINT)
-  fi
-  find "$HOME/Media/Disks" -maxdepth 1 -type l -delete 2>/dev/null || true
-  find "$HOME/Media/USB" -maxdepth 1 -type l -delete 2>/dev/null || true
-  rmdir "$HOME/Media/USB" 2>/dev/null || true
-  for src in "/media/$user" "/run/media/$user"; do
-    [[ -d "$src" ]] || continue
-    for d in "$src"/*; do
-      [[ -e "$d" ]] || continue
-      case "$(basename "$d" | tr '[:upper:]' '[:lower:]')" in
-        boot|efi|esp|system|recovery|winre|winre_drv) continue ;;
-      esac
-      ln -sfn "$d" "$HOME/Media/Disks/$(basename "$d")"
-    done
-  done
-  gvfs="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/gvfs"
-  rm -f "$HOME/Media/Phone"
-  if [[ -d "$gvfs" ]]; then
-    mtp="$(find "$gvfs" -maxdepth 1 \( -iname '*mtp*' -o -iname '*gphoto*' -o -iname '*afc*' \) 2>/dev/null | head -n1 || true)"
-    if [[ -n "${mtp:-}" && -e "$mtp" ]]; then
-      ln -sfn "$mtp" "$HOME/Media/Phone"
-    fi
-  fi
-}
-
 refresh_appfiles() {
   local dest="$HOME/Documents/AppFiles" d name
   mkdir -p "$dest" "$dest/debs" "$dest/rpms" "$dest/appimages"
@@ -374,7 +434,6 @@ bookmark() {
 log "Folders and sidebar"
 xdg-user-dirs-update || true
 mkdir -p "$HOME/Media/Disks" "$HOME/Videos/OBS" "$HOME/Documents/AppFiles"
-refresh_media_links
 refresh_appfiles
 bookmark "file://$HOME/Media" "Media"
 bookmark "file://$HOME/Documents/AppFiles" "AppFiles"
@@ -382,7 +441,7 @@ bookmark "file:///" "File System"
 
 # ---------------------------------------------------------------------------
 # USB watcher
-# User systemd service. Refreshes Media on udisks events and every 5 seconds.
+# User systemd service. Refreshes Media on udisks events, and once a minute.
 # Same on every distro. Needs a desktop login, not a raw TTY.
 # ---------------------------------------------------------------------------
 log "USB watcher"
@@ -430,8 +489,9 @@ refresh() {
   fi
 }
 refresh
-# udisks events, plus a poll, so a missed mount still shows up.
-( while true; do sleep 5; refresh; done ) &
+[[ "${1:-}" == "--once" ]] && exit 0
+# udisks events do the work. The slow poll only catches a missed event.
+( while true; do sleep 60; refresh; done ) &
 udisksctl monitor | while read -r line; do
   case "$line" in
     *Added*|*Removed*|*mounted*|*unmounted*|*Properties\ Changed*) refresh ;;
@@ -440,6 +500,8 @@ done
 EOF
 watch_changed=$KIT_CHANGED
 chmod +x "$HOME/.local/bin/human-linux-usb-watch"
+# The installer uses the watcher's own code to make the Media links now.
+"$HOME/.local/bin/human-linux-usb-watch" --once || true
 put_file "$HOME/.config/systemd/user/human-linux-usb-watch.service" <<EOF
 [Unit]
 Description=Refresh ReadyLinux Media links
@@ -886,64 +948,6 @@ X-ReadyLinux=true
 EOF
 
 # ---------------------------------------------------------------------------
-# AppImage launchers
-# Clicking an AppImage copies it to ~/Applications, makes a desktop file,
-# and links it under AppFiles. Same on every distro.
-# ---------------------------------------------------------------------------
-log "AppImage launchers"
-mkdir -p "$HOME/Applications" "$HOME/.local/share/icons" "$HOME/Documents/AppFiles/appimages"
-integrate_appimage() {
-  local src="$1" base name dest icon desk
-  [[ -f "$src" && ! -L "$src" ]] || return 0
-  base="$(basename "$src")"
-  name="${base%.[Aa]pp[Ii]mage}"
-  dest="$HOME/Applications/$base"
-  icon="$HOME/.local/share/icons/${name}.png"
-  if [[ "$src" != "$dest" ]]; then
-    mv "$src" "$dest"
-  fi
-  chmod +x "$dest" || true
-  ln -sfn "$dest" "$HOME/Documents/AppFiles/appimages/$base" || true
-  desk="$HOME/.local/share/applications/human-linux-appimage-${name}.desktop"
-  put_file "$desk" <<EOF
-[Desktop Entry]
-Name=$name
-Exec=$dest
-Icon=application-x-executable
-Terminal=false
-Type=Application
-Categories=Utility;
-StartupNotify=true
-EOF
-  chmod +x "$desk" || true
-  gio set "$desk" metadata::trusted true 2>/dev/null || true
-  (
-    cd /tmp
-    rm -rf squashfs-root
-    "$dest" --appimage-extract >/dev/null 2>&1 || true
-    found=""
-    if [[ -e squashfs-root/.DirIcon ]]; then
-      found="$(readlink -f squashfs-root/.DirIcon)"
-    fi
-    if [[ ! -s "$found" ]]; then
-      found="$(find squashfs-root -type f \( -iname '*.png' -o -iname '*.svg' \) 2>/dev/null | head -n1)"
-    fi
-    if [[ -s "$found" ]]; then
-      cp -f "$found" "$icon"
-      sed -i "s|^Icon=.*|Icon=$icon|" "$HOME/.local/share/applications/human-linux-appimage-${name}.desktop"
-    fi
-    rm -rf squashfs-root
-  ) || true
-  echo "integrated $base"
-}
-shopt -s nullglob
-for d in "$HOME/Downloads"/*.AppImage "$HOME/Downloads"/*.appimage \
-         "$HOME/Applications"/*.AppImage "$HOME/Applications"/*.appimage; do
-  integrate_appimage "$d"
-done
-shopt -u nullglob
-
-# ---------------------------------------------------------------------------
 # Brax.me
 # A site-as-app launcher. Same on every distro that has Brave or Chrome.
 # ---------------------------------------------------------------------------
@@ -951,7 +955,9 @@ log "Brax.me launcher"
 browser="$(command -v brave-browser || command -v google-chrome-stable || command -v google-chrome || true)"
 if [[ -n "$browser" ]]; then
   mkdir -p "$HOME/.local/share/icons"
-  curl -fsSL -o "$HOME/.local/share/icons/brax-me.png" "$BRAX_ICON_URL" || warn "Brax icon download failed"
+  [[ -s "$HOME/.local/share/icons/brax-me.png" ]] \
+    || fetch_image "$BRAX_ICON_URL" "$HOME/.local/share/icons/brax-me.png" \
+    || warn "Brax icon download failed"
   put_file "$HOME/.local/share/applications/brax-me.desktop" <<EOF
 [Desktop Entry]
 Name=Brax.me
@@ -1045,46 +1051,84 @@ if id="$(first_existing_desktop org.gnome.Software.desktop gnome-software.deskto
   done
 fi
 mkdir -p "$HOME/.local/bin" "$HOME/.local/share/applications"
+# ---------------------------------------------------------------------------
+# AppImage launchers
+# One helper does it all. Clicking an AppImage runs it. The installer runs it
+# with --no-run on AppImages already in Downloads or ~/Applications.
+# ---------------------------------------------------------------------------
 put_file "$HOME/.local/bin/open-appimage" <<'EOF'
 #!/usr/bin/env bash
-f="${1:-}"
-[[ -n "$f" && -f "$f" ]] || exit 1
-base="$(basename "$f")"
-name="${base%.[Aa]pp[Ii]mage}"
-mkdir -p "$HOME/Applications" "$HOME/.local/share/icons" "$HOME/Documents/AppFiles/appimages"
-dest="$HOME/Applications/$base"
-if [[ "$f" != "$dest" ]]; then
-  mv "$f" "$dest"
+# open-appimage [--no-run] FILE
+# Moves an AppImage to ~/Applications, makes it executable, links it under
+# AppFiles, and adds a Show Apps launcher with the app's own icon. Then it
+# starts the app. The installer passes --no-run for ones already downloaded.
+run=1
+if [[ "${1:-}" == "--no-run" ]]; then
+  run=0
+  shift
 fi
+f="${1:-}"
+[[ -n "$f" && -f "$f" && ! -L "$f" ]] || exit 1
+base="$(basename "$f")"
+case "${base,,}" in
+  *.appimage) ;;
+  *)
+    zenity --error --text="Not an AppImage: $base" 2>/dev/null || echo "Not an AppImage: $base" >&2
+    exit 1
+    ;;
+esac
+name="${base%.[Aa]pp[Ii]mage}"
+apps="$HOME/.local/share/applications"
+desk="$apps/human-linux-appimage-${name}.desktop"
+dest="$HOME/Applications/$base"
+# A rerun of the installer leaves an AppImage that is already set up alone.
+if [[ "$run" == 0 && -f "$desk" && "$f" -ef "$dest" ]]; then
+  echo "    up to date $base"
+  exit 0
+fi
+mkdir -p "$HOME/Applications" "$HOME/.local/share/icons" "$HOME/Documents/AppFiles/appimages" "$apps"
+[[ "$f" -ef "$dest" ]] || mv "$f" "$dest"
 chmod +x "$dest" || true
 ln -sfn "$dest" "$HOME/Documents/AppFiles/appimages/$base"
-icon="$HOME/.local/share/icons/${name}.png"
-cat > "$HOME/.local/share/applications/human-linux-appimage-${name}.desktop" <<DESK
+cat > "$desk" <<DESK
 [Desktop Entry]
 Name=$name
-Exec=$dest
+Exec="$dest"
 Icon=application-x-executable
 Terminal=false
 Type=Application
 Categories=Utility;
+StartupNotify=true
 X-ReadyLinux=true
 DESK
-( cd /tmp && rm -rf squashfs-root
+chmod +x "$desk" || true
+gio set "$desk" metadata::trusted true 2>/dev/null || true
+# Extract in a private folder. The icon is .DirIcon, or the first image inside.
+# A link that points outside the extracted tree is ignored.
+work="$(mktemp -d)"
+(
+  cd "$work" || exit 0
   "$dest" --appimage-extract >/dev/null 2>&1 || true
   found=""
-  if [[ -e squashfs-root/.DirIcon ]]; then
-    found="$(readlink -f squashfs-root/.DirIcon)"
-  fi
-  if [[ ! -s "$found" ]]; then
+  [[ -e squashfs-root/.DirIcon ]] && found="$(readlink -f squashfs-root/.DirIcon)"
+  if [[ "$found" != "$work"/* || ! -s "$found" ]]; then
     found="$(find squashfs-root -type f \( -iname '*.png' -o -iname '*.svg' \) 2>/dev/null | head -n1)"
   fi
   if [[ -s "$found" ]]; then
+    case "${found,,}" in
+      *.svg) icon="$HOME/.local/share/icons/${name}.svg" ;;
+      *)     icon="$HOME/.local/share/icons/${name}.png" ;;
+    esac
     cp -f "$found" "$icon"
-    sed -i "s|^Icon=.*|Icon=$icon|" "$HOME/.local/share/applications/human-linux-appimage-${name}.desktop"
+    sed -i "s|^Icon=.*|Icon=$icon|" "$desk"
   fi
-  rm -rf squashfs-root )
-update-desktop-database "$HOME/.local/share/applications" 2>/dev/null || true
-exec "$dest"
+)
+rm -rf "$work"
+update-desktop-database "$apps" 2>/dev/null || true
+echo "    integrated $base"
+if [[ "$run" == 1 ]]; then
+  exec "$dest"
+fi
 EOF
 chmod +x "$HOME/.local/bin/open-appimage"
 put_file "$HOME/.local/share/applications/open-appimage.desktop" <<EOF
@@ -1093,7 +1137,7 @@ Name=Install AppImage
 Exec=$HOME/.local/bin/open-appimage %f
 Terminal=false
 Type=Application
-MimeType=application/vnd.appimage;application/x-iso9660-appimage;application/x-executable;
+MimeType=application/vnd.appimage;application/x-iso9660-appimage;
 NoDisplay=true
 X-ReadyLinux=true
 EOF
@@ -1111,6 +1155,13 @@ EOF
 update-mime-database "$HOME/.local/share/mime" 2>/dev/null || true
 xdg-mime default open-appimage.desktop application/vnd.appimage || true
 xdg-mime default open-appimage.desktop application/x-iso9660-appimage || true
+log "AppImage launchers"
+shopt -s nullglob
+for d in "$HOME/Downloads"/*.AppImage "$HOME/Downloads"/*.appimage \
+         "$HOME/Applications"/*.AppImage "$HOME/Applications"/*.appimage; do
+  "$HOME/.local/bin/open-appimage" --no-run "$d" || warn "Could not set up $(basename "$d")"
+done
+shopt -u nullglob
 # An executable AppImage is launched by Files and skips this handler.
 # Leave Downloads copies non-executable so a click installs them.
 shopt -s nullglob
@@ -1448,19 +1499,13 @@ if added:
 else:
     print("mate panel unchanged")
 PY
-    # Mint's bottom bar is 24px. 36 is readable without being tall.
-    python3 - <<'PY' || true
-import ast, subprocess
-raw = subprocess.check_output(["gsettings", "get", "org.mate.panel", "toplevel-id-list"], text=True).strip()
-try:
-    ids = ast.literal_eval(raw)
-except Exception:
-    ids = ["bottom"]
-for tid in ids:
-    path = f"org.mate.panel.toplevel:/org/mate/panel/toplevels/{tid}/"
-    subprocess.run(["gsettings", "set", path, "size", "40"], check=False)
-    print("panel size", tid)
-PY
+    # Mint's bottom bar is 24px. 40 matches the other desktops.
+    tids="$(gsettings get org.mate.panel toplevel-id-list 2>/dev/null | tr -d "[],'" || true)"
+    args=()
+    for tid in ${tids:-bottom}; do
+      args+=("org.mate.panel.toplevel:/org/mate/panel/toplevels/$tid/" size 40)
+    done
+    gset_once "${args[@]}"
     ;;
   *xfce*)
     log "Xfce Whisker favorites and left-side pins"
@@ -1546,13 +1591,6 @@ PY
       xfconf-query -c xfce4-panel -p /panels/panel-1/icon-size -n -t int -s 40 || true
     fi
     sudo apt-get install -y wmctrl xdotool || true
-    if gsettings list-schemas | grep -qx 'org.gnome.TextEditor'; then
-      gsettings set org.gnome.TextEditor use-system-font false || true
-      gsettings set org.gnome.TextEditor custom-font 'Monospace 12' || true
-      echo "text editor font $(gsettings get org.gnome.TextEditor custom-font 2>/dev/null || echo failed)"
-    else
-      echo "no text editor schema"
-    fi
     # Xed remembers a maximized 1920x1003 window. 0 is not maximized.
     if gsettings list-schemas | grep -qx 'org.x.editor.state.window'; then
       gsettings set org.x.editor.state.window size "(1100, 700)" || true
@@ -1611,13 +1649,10 @@ EOF
     pin_gnome org.gnome.shell org.gnome.Nautilus.desktop org.gnome.TextEditor.desktop || true
     if gsettings list-schemas | grep -q 'org.gnome.shell.extensions.dash-to-dock'; then
       gnome-extensions enable dash-to-dock@micxgx.gmail.com 2>/dev/null || true
-      pos="$(gsettings get org.gnome.shell.extensions.dash-to-dock dock-position 2>/dev/null || echo '')"
-      if [[ "$pos" == "'LEFT'" ]]; then
-        gsettings set org.gnome.shell.extensions.dash-to-dock dock-position 'BOTTOM' || true
-        gsettings set org.gnome.shell.extensions.dash-to-dock extend-height false || true
-      fi
-      size="$(gsettings get org.gnome.shell.extensions.dash-to-dock dash-max-icon-size 2>/dev/null || echo '')"
-      gsettings set org.gnome.shell.extensions.dash-to-dock dash-max-icon-size 40 || true
+      # Only if the dock is still where the distro put it.
+      gset_once org.gnome.shell.extensions.dash-to-dock dock-position "'BOTTOM'" \
+                org.gnome.shell.extensions.dash-to-dock extend-height false \
+                org.gnome.shell.extensions.dash-to-dock dash-max-icon-size 40
     fi
     ;;
 esac
@@ -1632,15 +1667,13 @@ if gsettings list-schemas | grep -qx 'org.gnome.nautilus.window-state'; then
   gsettings set org.gnome.nautilus.window-state maximized false || true
   gsettings set org.gnome.nautilus.window-state initial-size '(1100, 700)' || true
 fi
-if gsettings list-schemas | grep -qx 'org.gnome.TextEditor'; then
-  gsettings set org.gnome.TextEditor style-scheme 'classic' || true
-  gsettings set org.gnome.TextEditor use-system-font false || true
-  gsettings set org.gnome.TextEditor custom-font 'Monospace 12' || true
-elif gsettings list-schemas | grep -qx 'org.gnome.gedit.preferences.editor'; then
-  gsettings set org.gnome.gedit.preferences.editor scheme 'classic' || true
-  gsettings set org.gnome.gedit.preferences.editor use-default-font false || true
-  gsettings set org.gnome.gedit.preferences.editor editor-font 'Monospace 12' || true
-fi
+# Preferences below are set once. A value you changed yourself is kept.
+gset_once org.gnome.TextEditor style-scheme "'classic'" \
+          org.gnome.TextEditor use-system-font false \
+          org.gnome.TextEditor custom-font "'Monospace 12'" \
+          org.gnome.gedit.preferences.editor scheme "'classic'" \
+          org.gnome.gedit.preferences.editor use-default-font false \
+          org.gnome.gedit.preferences.editor editor-font "'Monospace 12'"
 python3 - <<'PY' || true
 from pathlib import Path
 try:
@@ -1664,66 +1697,46 @@ new = GLib.Variant("a{sv}", items)
 path.write_bytes(bytes(new.get_data_as_bytes().get_data()))
 print("text editor window 1100x700")
 PY
-if gsettings list-schemas | grep -qx 'org.x.editor.preferences.editor'; then
-  gsettings set org.x.editor.preferences.editor use-default-font false || true
-  gsettings set org.x.editor.preferences.editor editor-font 'Monospace 12' || true
-fi
+gset_once org.x.editor.preferences.editor use-default-font false \
+          org.x.editor.preferences.editor editor-font "'Monospace 12'"
 
-# Terminal frame is 110x34 on the distros we support.
+# Terminal frame is 110x34 on the distros we support. Colors are not touched.
 # Newer Ubuntu uses Ptyxis. Zorin and Mint use GNOME Terminal.
-if gsettings list-schemas | grep -qx 'org.gnome.Ptyxis'; then
-  gsettings set org.gnome.Ptyxis default-columns 110 || true
-  gsettings set org.gnome.Ptyxis default-rows 34 || true
-  gsettings set org.gnome.Ptyxis use-system-font false || true
-  gsettings set org.gnome.Ptyxis font-name 'Monospace 10' || true
-fi
+gset_once org.gnome.Ptyxis default-columns 110 \
+          org.gnome.Ptyxis default-rows 34 \
+          org.gnome.Ptyxis use-system-font false \
+          org.gnome.Ptyxis font-name "'Monospace 10'"
 if gsettings list-schemas | grep -qx 'org.gnome.Terminal.Legacy.Settings' && command -v gnome-terminal >/dev/null; then
-  python3 - <<'PY' || true
-import subprocess
-def setv(path, key, val):
-    subprocess.check_call(["gsettings", "set", path, key, val])
-raw = subprocess.check_output(["dconf", "list", "/org/gnome/terminal/legacy/profiles:/"], text=True)
-uids = [line.strip("/:") for line in raw.splitlines() if line.strip()]
-default = ""
-if "default" in subprocess.check_output(["gsettings", "list-keys", "org.gnome.Terminal.Legacy.Settings"], text=True).split():
-    default = subprocess.check_output(["gsettings", "get", "org.gnome.Terminal.Legacy.Settings", "default"], text=True).strip().strip("'")
-if default and default not in uids:
-    uids.append(default)
-if not uids:
-    print("gnome-terminal has no profile yet; size applies after the first terminal is closed and opened")
-for uid in uids:
-    path = f"org.gnome.Terminal.Legacy.Profile:/org/gnome/terminal/legacy/profiles:/:{uid}/"
-    setv(path, "default-size-columns", "110")
-    setv(path, "default-size-rows", "34")
-    setv(path, "use-system-font", "false")
-    setv(path, "font", "'Monospace 10'")
-    setv(path, "use-theme-colors", "false")
-    setv(path, "foreground-color", "'#FFFFFF'")
-    setv(path, "background-color", "'#000000'")
-    print("gnome-terminal next window 110x34", uid)
-PY
-  mkdir -p "$HOME/.local/share/applications"
-  put_file "$HOME/.local/share/applications/org.gnome.Terminal.desktop" <<EOF
-[Desktop Entry]
-Name=Terminal
-Exec=gnome-terminal --geometry=110x34
-Icon=org.gnome.Terminal
-Terminal=false
-Type=Application
-Categories=System;TerminalEmulator;
-StartupNotify=true
-EOF
+  uids="$(dconf list /org/gnome/terminal/legacy/profiles:/ 2>/dev/null | tr -d ':/' || true)"
+  default="$(gsettings get org.gnome.Terminal.Legacy.Settings default 2>/dev/null | tr -d "'" || true)"
+  [[ -n "$default" && " $uids " != *" $default "* ]] && uids="$uids $default"
+  args=()
+  for uid in $uids; do
+    path="org.gnome.Terminal.Legacy.Profile:/org/gnome/terminal/legacy/profiles:/:$uid/"
+    args+=("$path" default-size-columns 110 "$path" default-size-rows 34
+           "$path" use-system-font false "$path" font "'Monospace 10'")
+  done
+  if ((${#args[@]})); then
+    gset_once "${args[@]}"
+  else
+    echo "    gnome-terminal has no profile yet. Size applies after the next run."
+  fi
+  # Older kits replaced the Terminal launcher to force --geometry. The profile
+  # size does the same job, so put the system launcher back.
+  old_term="$HOME/.local/share/applications/org.gnome.Terminal.desktop"
+  if [[ -f "$old_term" ]] && grep -qx 'Exec=gnome-terminal --geometry=110x34' "$old_term"; then
+    rm -f "$old_term"
+    echo "    removed the old forced-size Terminal launcher"
+  fi
 fi
-# Xfce Terminal ignores the GNOME geometry. 110x34, 10pt, black on white.
+# Xfce Terminal ignores the GNOME geometry. Each key is added only if missing.
 if [[ -d /usr/share/xfce4/terminal || -f /usr/bin/xfce4-terminal ]]; then
   mkdir -p "$HOME/.config/xfce4/terminal"
   termrc="$HOME/.config/xfce4/terminal/terminalrc"
   touch "$termrc"
   grep -q '^\[Configuration\]' "$termrc" || printf '\n[Configuration]\n' >> "$termrc"
-  for kv in "MiscDefaultGeometry=120x36" "FontName=Monospace 10" "ColorForeground=#ffffff" "ColorBackground=#000000"; do
-    key="${kv%%=*}"
-    sed -i "/^${key}=/d" "$termrc"
-    printf '%s\n' "$kv" >> "$termrc"
+  for kv in "MiscDefaultGeometry=120x36" "FontName=Monospace 10"; do
+    grep -q "^${kv%%=*}=" "$termrc" || printf '%s\n' "$kv" >> "$termrc"
   done
 fi
 
@@ -1737,23 +1750,18 @@ else
   SCALE="1.0"
 fi
 log "Screen scale $SCALE"
-if gsettings writable org.gnome.desktop.interface text-scaling-factor >/dev/null 2>&1; then
-  gsettings set org.gnome.desktop.interface text-scaling-factor "$SCALE" || true
-fi
-if gsettings writable org.cinnamon.desktop.interface text-scaling-factor >/dev/null 2>&1; then
-  gsettings set org.cinnamon.desktop.interface text-scaling-factor "$SCALE" || true
-fi
-if gsettings writable org.cinnamon active-display-scale >/dev/null 2>&1; then
-  gsettings set org.cinnamon active-display-scale "$SCALE" || true
-fi
+gset_once org.gnome.desktop.interface text-scaling-factor "$SCALE" \
+          org.cinnamon.desktop.interface text-scaling-factor "$SCALE" \
+          org.cinnamon active-display-scale "$SCALE"
 # MATE has no 125% display scale. 120 DPI is the same size change.
-if [[ "$SCALE" == "1.25" ]] && gsettings writable org.mate.font-rendering dpi >/dev/null 2>&1; then
-  gsettings set org.mate.font-rendering dpi 120 || true
+if [[ "$SCALE" == "1.25" ]]; then
+  gset_once org.mate.font-rendering dpi 120.0
 fi
 # Xfce uses DPI, not the GNOME scale key. 120 is the 125% size.
-if [[ "$SCALE" == "1.25" ]] && command -v xfconf-query >/dev/null; then
-  xfconf-query -c xsettings -p /Xft/DPI -n -t int -s 120 2>/dev/null || \
-    xfconf-query -c xsettings -p /Xft/DPI -t int -s 120 2>/dev/null || true
+# Set only when no DPI was chosen yet.
+if [[ "$SCALE" == "1.25" ]] && command -v xfconf-query >/dev/null \
+   && ! xfconf-query -c xsettings -p /Xft/DPI >/dev/null 2>&1; then
+  xfconf-query -c xsettings -p /Xft/DPI -n -t int -s 120 2>/dev/null || true
 fi
 if [[ "$SCALE" == "1.25" && -f "$HOME/.config/cinnamon-monitors.xml" ]]; then
   sed -i 's/scale="0.75"/scale="1.25"/g; s/<scale>0.75<\/scale>/<scale>1.25<\/scale>/g' \
@@ -1766,7 +1774,7 @@ if [[ -n "$WALLPAPER_URL" ]]; then
   if gsettings list-schemas | grep -qx 'org.mate.background'; then
     current="$(gsettings get org.mate.background picture-filename 2>/dev/null || echo '')"
     if [[ "$current" == *"/usr/share/backgrounds/"* || "$current" == "''" ]]; then
-      if curl -fsSL -o "$wall" "$WALLPAPER_URL"; then
+      if [[ -s "$wall" ]] || fetch_image "$WALLPAPER_URL" "$wall"; then
         gsettings set org.mate.background picture-filename "$wall" || true
         gsettings set org.mate.background picture-options 'zoom' || true
       else
@@ -1780,7 +1788,7 @@ if [[ -n "$WALLPAPER_URL" ]]; then
     dark="$(gsettings get org.gnome.desktop.background picture-uri-dark 2>/dev/null || echo '')"
     if [[ "$current" == *"human-linux-wallpaper.jpg"* && "$dark" == *"human-linux-wallpaper.jpg"* ]]; then
       log "Wallpaper already set."
-    elif curl -fsSL -o "$wall" "$WALLPAPER_URL"; then
+    elif [[ -s "$wall" ]] || fetch_image "$WALLPAPER_URL" "$wall"; then
       gsettings set org.gnome.desktop.background picture-uri "file://$wall" || true
       gsettings set org.gnome.desktop.background picture-uri-dark "file://$wall" || true
       gsettings set org.gnome.desktop.background picture-options 'zoom' || true
@@ -1796,7 +1804,7 @@ fi
 if [[ -n "$WALLPAPER_URL" ]] && command -v xfconf-query >/dev/null && [[ "$de" == *xfce* ]]; then
   mkdir -p "$HOME/.local/share/backgrounds"
   wall="$HOME/.local/share/backgrounds/human-linux-wallpaper.jpg"
-  if curl -fsSL -o "$wall" "$WALLPAPER_URL"; then
+  if [[ -s "$wall" ]] || fetch_image "$WALLPAPER_URL" "$wall"; then
     for prop in \
       /backdrop/screen0/monitoreDP-1/workspace0/last-image \
       /backdrop/screen0/monitoreDP-1/workspace0/image-path \
@@ -1913,3 +1921,6 @@ echo "Show Apps: ReadyLinux install, and ReadyLinux uninstall."
 echo "Log out and back in if Show Apps or the dock did not update."
 echo "On Zorin, dock icons can show but not click until that logout."
 echo "Lid-on-AC applies fully after the next reboot. logind was not restarted."
+}
+
+[[ -n "${READYLINUX_TEST:-}" ]] || main "$@"

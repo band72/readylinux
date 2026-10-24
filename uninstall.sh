@@ -2,6 +2,12 @@
 # ReadyLinux — uninstall
 # Removes files and rules the install script created.
 # Does not remove packages. Does not undo dock, scale, pins, or browser defaults.
+# Mint's file manager may run this with sh. sh would fail on the bash syntax below.
+if [ -z "${BASH_VERSION:-}" ]; then
+  exec bash "$0" "$@"
+fi
+# One function, called on the last line, so a cut-off download runs nothing.
+main() {
 if [[ ! -t 1 ]]; then
   zenity --question --width=420 --title="ReadyLinux uninstall" \
     --text="This removes the links, bookmarks, watcher, Find my file, Brax.me, the lid rule, the IPv4 preference, and the file associations for deb, rpm, AppImage, ISO, video, and scripts.\n\nPackages stay installed. A terminal will open for your password. Continue?" \
@@ -49,13 +55,15 @@ rm -f "$HOME/.config/systemd/user/human-linux-usb-watch.service" \
       "$HOME/.local/share/icons/brax-me.png" \
       "$HOME/.local/share/icons/hicolor/scalable/apps/readylinux-find-my-file.svg" \
       "$HOME/.local/share/human-linux/version" \
+      "$HOME/.local/share/human-linux/settings.json" \
       "$HOME/.local/share/backgrounds/human-linux-wallpaper.jpg"
 # Undo AppImage integration. Remove the launcher and put the file back in Downloads.
 shopt -s nullglob
 for f in "$HOME/Applications"/*.AppImage "$HOME/Applications"/*.appimage \
          "$HOME/Documents"/*.AppImage "$HOME/Documents"/*.appimage; do
   base="$(basename "$f")"
-  [[ -e "$HOME/Downloads/$base" ]] || mv "$f" "$HOME/Downloads/$base"
+  [[ -e "$HOME/Downloads/$base" ]] && continue
+  mv "$f" "$HOME/Downloads/$base"
   echo "restored $base to Downloads"
 done
 for desk in "$HOME/.local/share/applications"/*.desktop; do
@@ -161,3 +169,6 @@ shopt -u nullglob
 log "Uninstall done. Packages were left installed. Dock, scale, and pins were left as they are."
 echo "Lid file is removed. It applies on the next reboot. logind was not restarted."
 echo "IPv6 is preferred again."
+}
+
+main "$@"
